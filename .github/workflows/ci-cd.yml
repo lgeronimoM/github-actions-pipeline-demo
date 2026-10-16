@@ -1,0 +1,134 @@
+name: CI/CD Pipeline
+run-name: "CI/CD ${{ github.ref_name }} (${{ github.event_name }})"
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: demo-api
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint Dockerfile (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run unit tests
+        run: python -m unittest discover -s app -v
+
+  build:
+    name: Build, scan & publish image
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t ${IMAGE_NAME}:ci .
+
+      - name: Vulnerability scan (Trivy, report only)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.57.1 image --severity HIGH,CRITICAL \
+            --ignore-unfixed --exit-code 0 ${IMAGE_NAME}:ci
+
+      - name: Save image as artifact
+        run: docker save ${IMAGE_NAME}:ci -o image.tar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: image.tar
+          retention-days: 1
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image to GHCR (tag = commit SHA)
+        if: github.event_name == 'push'
+        run: |
+          REPO="${GITHUB_REPOSITORY,,}"
+          docker tag ${IMAGE_NAME}:ci "ghcr.io/${REPO}:${GITHUB_SHA}"
+          docker push "ghcr.io/${REPO}:${GITHUB_SHA}"
+          echo "### Image published: \`ghcr.io/${REPO}:${GITHUB_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy ${{ matrix.env }} (temporary)
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      max-parallel: 1          # staging first, then production
+      matrix:
+        env: [staging, production]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+
+      - name: Load image
+        run: docker load -i image.tar
+
+      - name: Deploy temporary ${{ matrix.env }} container
+        run: |
+          docker run -d --name demo-${{ matrix.env }} \
+            --read-only --cap-drop ALL \
+            -e APP_ENV=${{ matrix.env }} \
+            -p 8080:8080 ${IMAGE_NAME}:ci
+
+      - name: Wait until healthy
+        run: |
+          for i in $(seq 1 30); do
+            STATUS=$(docker inspect -f '{{.State.Health.Status}}' demo-${{ matrix.env }})
+            echo "health: $STATUS"
+            [ "$STATUS" = "healthy" ] && exit 0
+            sleep 2
+          done
+          exit 1
+
+      - name: Smoke tests
+        run: |
+          curl -fsS http://localhost:8080/healthz
+          curl -fsS http://localhost:8080/ | tee /tmp/root.json
+          grep -q '"env": "${{ matrix.env }}"' /tmp/root.json
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          docker ps -a
+          docker logs demo-${{ matrix.env }} || true
+
+      - name: Teardown
+        if: always()
+        run: docker rm -f demo-${{ matrix.env }} || true
+
+      - name: Summary
+        if: success()
+        run: echo "### ✅ ${{ matrix.env }} deployed, verified and torn down" >> "$GITHUB_STEP_SUMMARY"
